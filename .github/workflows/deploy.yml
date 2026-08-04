@@ -108,20 +108,22 @@ jobs:
             exit 0
           fi
 
-          # Only content files matter here. The live branch is always ahead on
-          # build output, which is expected and not drift.
+          # Any file that differs counts as drift, except build output.
           #
-          # sections/ is included deliberately. Section group files such as
-          # sections/header-group.json hold the header and footer configuration
-          # and the theme editor writes to them constantly. An earlier version of
-          # this check omitted them, and a real header colour change made in the
-          # admin passed straight through it. Only .json is matched, so section
-          # .liquid source is not treated as content.
+          # Shopify commits whatever changes on a connected theme: settings JSON
+          # from the theme editor, Liquid from the code editor, and files written
+          # by installed apps. An allow-list of "content" paths would let every
+          # other file through, and this gate exists precisely to stop the deploy
+          # overwriting things nobody knew were changed.
+          #
+          # The exclusions below are the compiled Vite output, which lives on the
+          # live branch by design and is expected to differ on every release.
           CHANGED=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE_BRANCH...$LIVE_BRANCH" \
             --jq '[.files[]?.filename
-                   | select(startswith("templates/") or startswith("config/")
-                            or startswith("locales/") or startswith("sections/"))
-                   | select(endswith(".json"))] | join("\n")')
+                   | select(test("^assets/.*\\.(asset|bundle|chunk)\\.") | not)
+                   | select(. != "assets/manifest.json" and . != "assets/runtime.js")
+                   | select(test("^snippets/(vite-tag|script-tags|style-tags)\\.liquid$") | not)
+                  ] | join("\n")')
 
           if [ -n "$CHANGED" ]; then
             {
