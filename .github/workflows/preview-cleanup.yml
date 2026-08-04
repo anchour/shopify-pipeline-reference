@@ -1,0 +1,72 @@
+# Deletes a pull request's preview theme when the pull request closes.
+#
+# This is why previews are scoped to the pull request rather than the branch:
+# a pull request has a close event, a branch does not. Without this trigger every
+# abandoned branch would strand a theme against the store's theme limit.
+name: Preview cleanup
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: preview-cleanup-${{ github.event.pull_request.number }}
+
+jobs:
+  cleanup:
+    name: Delete preview theme
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      SHOPIFY_FLAG_STORE: ${{ vars.SHOPIFY_STORE }}
+      SHOPIFY_CLI_THEME_TOKEN: ${{ secrets.SHOPIFY_CLI_THEME_TOKEN }}
+      SHOPIFY_CLI_TTY: 0
+      THEME_NAME: "PR#${{ github.event.pull_request.number }} preview"
+
+    steps:
+      - name: Install Shopify CLI
+        run: npm install -g @shopify/cli@${{ vars.SHOPIFY_CLI_VERSION || '3.91.0' }}
+
+      # Guard against deleting the published theme.
+      #
+      # The inherited cleanup ran `shopify theme delete --force` against a
+      # name-matched theme with no such check. Deletion is irreversible, so
+      # confirm the target is both ours and unpublished before removing it.
+      - name: Delete preview theme
+        run: |
+          set -uo pipefail
+
+          shopify theme list --json > /tmp/themes.json
+
+          THEME_ID=$(jq -r --arg name "$THEME_NAME" \
+            '.[] | select(.name == $name) | .id' /tmp/themes.json | head -1)
+
+          if [ -z "$THEME_ID" ] || [ "$THEME_ID" = "null" ]; then
+            echo "::notice::No theme named '$THEME_NAME'. Nothing to clean up."
+            exit 0
+          fi
+
+          ROLE=$(jq -r --arg id "$THEME_ID" \
+            '.[] | select(.id == ($id | tonumber)) | .role' /tmp/themes.json)
+
+          if [ "$ROLE" = "main" ] || [ "$ROLE" = "live" ]; then
+            echo "::error::Theme $THEME_ID is published (role: $ROLE). Refusing to delete."
+            exit 1
+          fi
+
+          shopify theme delete --force --theme "$THEME_ID"
+          echo "::notice::Deleted preview theme $THEME_ID ($THEME_NAME)."
+
+      - name: Update preview comment
+        uses: marocchino/sticky-pull-request-comment@52423e01640425a022ef5fd42c6fb5f633a02728 # v2.9.1
+        with:
+          header: preview
+          message: |
+            ### Preview theme removed
+
+            The preview theme for this pull request has been deleted.

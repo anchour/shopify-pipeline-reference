@@ -1,0 +1,94 @@
+# Creates an unpublished preview theme for each pull request and posts its links
+# as a comment.
+#
+# CHANGE FROM INHERITED PIPELINE
+# The original required a `preview: production` or `preview: development` label
+# before it would build a preview, so reviewers frequently had nothing to look at
+# unless someone remembered to label the pull request. Previews are automatic
+# here. Opting out is still possible with a `skip-preview` label, which is the
+# safer default direction: forget the label and you get a preview, rather than
+# forget the label and you get nothing.
+name: Preview
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+# Needs write access to post the preview comment. Nothing more.
+permissions:
+  contents: read
+  pull-requests: write
+
+# One preview per pull request. A new push supersedes the in-flight run.
+concurrency:
+  group: preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    name: Preview Theme
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-preview')"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      SHOPIFY_FLAG_STORE: ${{ vars.SHOPIFY_STORE }}
+      SHOPIFY_CLI_THEME_TOKEN: ${{ secrets.SHOPIFY_CLI_THEME_TOKEN }}
+      SHOPIFY_CLI_TTY: 0
+      THEME_NAME: "PR#${{ github.event.pull_request.number }} preview"
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Shopify CLI
+        run: npm install -g @shopify/cli@${{ vars.SHOPIFY_CLI_VERSION || '3.91.0' }}
+
+      # `--unpublished` is what keeps this off the storefront. `--json` gives us
+      # the theme id without scraping human-readable output.
+      - name: Push preview theme
+        id: push
+        run: |
+          set -euo pipefail
+          shopify theme push \
+            --unpublished \
+            --theme "$THEME_NAME" \
+            --json > theme.json
+
+          THEME_ID=$(jq -r '.theme.id' theme.json)
+          if [ -z "$THEME_ID" ] || [ "$THEME_ID" = "null" ]; then
+            echo "::error::Could not determine theme id from CLI output."
+            cat theme.json
+            exit 1
+          fi
+
+          {
+            echo "theme_id=$THEME_ID"
+            echo "preview_url=https://${SHOPIFY_FLAG_STORE}/?preview_theme_id=${THEME_ID}"
+            echo "editor_url=https://${SHOPIFY_FLAG_STORE}/admin/themes/${THEME_ID}/editor"
+          } >> "$GITHUB_OUTPUT"
+
+      # Published as a job output so downstream jobs read it from here rather
+      # than parsing a pull request comment.
+      #
+      # DEFECT FIXED (inherited pipeline: cypress-runner.yml)
+      # The original discovered its target by scraping a URL out of a PR comment
+      # via a composite action, which is fragile and unnecessary.
+      - name: Comment preview links
+        uses: marocchino/sticky-pull-request-comment@52423e01640425a022ef5fd42c6fb5f633a02728 # v2.9.1
+        with:
+          header: preview
+          message: |
+            ### Preview theme ready
+
+            | | |
+            | --- | --- |
+            | Storefront | ${{ steps.push.outputs.preview_url }} |
+            | Theme editor | ${{ steps.push.outputs.editor_url }} |
+            | Theme ID | `${{ steps.push.outputs.theme_id }}` |
+
+            Updated for commit ${{ github.event.pull_request.head.sha }}.
+            This theme is unpublished and is deleted automatically when the pull request closes.
+
+    outputs:
+      theme_id: ${{ steps.push.outputs.theme_id }}
+      preview_url: ${{ steps.push.outputs.preview_url }}

@@ -1,0 +1,76 @@
+# Continuous integration checks. These are the checks intended to become
+# required for merge.
+#
+# DEFECT FIXED (inherited pipeline: lint.yml)
+# The original ran on `pull_request_target` while checking out pull-request head
+# code and then running `npm ci`. That combination executes untrusted contributor
+# code in a context holding repository and organisation secrets, which is a
+# well-documented GitHub Actions vulnerability. Linting needs no secrets, so the
+# correct trigger is plain `pull_request`: the token is read-only and the job
+# cannot reach repository secrets.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+
+# DEFECT FIXED (inherited pipeline: six of eight workflows)
+# Those declared no permissions block, so they inherited the repository default,
+# which is write. Declare least privilege explicitly.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  theme-check:
+    name: Theme Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # DEFECT FIXED (inherited pipeline: CLI version drift)
+      # The original installed the Shopify CLI unpinned in lint.yml and pinned to
+      # 3.57.1 in two other workflows, so one pipeline could run two different
+      # Theme Check rule sets. Version is declared once, as a repository variable,
+      # so it is changed in one place.
+      - name: Install Shopify CLI
+        run: npm install -g @shopify/cli@${{ vars.SHOPIFY_CLI_VERSION || '3.91.0' }}
+
+      # Gated on errors rather than warnings so an existing warning backlog does
+      # not block day one. Tighten to `--fail-level warning` once clean.
+      - name: Run Theme Check
+        run: shopify theme check --fail-level error
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: '20'
+
+      # Dawn ships no package.json. Rather than let this job pass silently and
+      # look like it ran, detect the situation and say so in the log.
+      - name: Detect Node project
+        id: node
+        run: |
+          if [ -f package.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No package.json in this theme. JS and CSS linting skipped."
+          fi
+
+      - name: Install dependencies
+        if: steps.node.outputs.present == 'true'
+        run: npm ci
+
+      - name: Lint
+        if: steps.node.outputs.present == 'true'
+        run: npm run lint --if-present

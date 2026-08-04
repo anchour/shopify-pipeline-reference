@@ -1,0 +1,142 @@
+# Publishes the theme when a pull request merges to main, then notifies Slack.
+#
+# The inherited pipeline used a three-branch dance (main, main-built, main-live)
+# because Shopify writes merchandiser changes back to the connected branch. That
+# structure is sound and is retained in the production design. This rehearsal
+# deploys directly, so the moving parts under test are the deploy, the failure
+# path, and the notification rather than the branch topology.
+name: Deploy
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  # Manual trigger so a rollback can be run without inventing a commit.
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: Why this deploy is being run manually
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Never run two deploys at once, and never cancel one midway: a half-applied
+# theme push is the state we most want to avoid.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to production
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      SHOPIFY_FLAG_STORE: ${{ vars.SHOPIFY_STORE }}
+      SHOPIFY_CLI_THEME_TOKEN: ${{ secrets.SHOPIFY_CLI_THEME_TOKEN }}
+      SHOPIFY_CLI_TTY: 0
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Install Shopify CLI
+        run: npm install -g @shopify/cli@${{ vars.SHOPIFY_CLI_VERSION || '3.91.0' }}
+
+      # Rollback theme, taken BEFORE anything is changed.
+      #
+      # Publishing a different theme in Shopify severs the GitHub connection on
+      # the theme that was live, so recovery is a documented multi-step process.
+      # Capturing a known-good copy first turns rollback into "publish this
+      # theme" instead of "reconstruct the last good state under pressure".
+      - name: Capture rollback theme
+        id: rollback
+        run: |
+          set -euo pipefail
+          STAMP=$(date -u +%Y%m%d-%H%M%S)
+          NAME="rollback-${STAMP}"
+
+          # Pull what is live right now, then park it as an unpublished theme.
+          mkdir -p /tmp/live
+          shopify theme pull --live --path /tmp/live --nodelete
+          shopify theme push \
+            --unpublished \
+            --theme "$NAME" \
+            --path /tmp/live \
+            --json > /tmp/rollback.json
+
+          ROLLBACK_ID=$(jq -r '.theme.id' /tmp/rollback.json)
+          echo "rollback_id=$ROLLBACK_ID" >> "$GITHUB_OUTPUT"
+          echo "rollback_name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "::notice::Rollback theme $NAME (id $ROLLBACK_ID) captured."
+
+      # DEFECT FIXED (inherited pipeline: deploy-release.yml)
+      # The original merged with `-X theirs`, so on conflict the repository
+      # version silently overwrote merchandiser content that Shopify had written
+      # to the live branch. Someone's work disappeared with no error and no log
+      # line. Detect drift and report it instead of resolving it silently.
+      - name: Check for live drift
+        id: drift
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          mkdir -p /tmp/check
+          shopify theme pull --live --path /tmp/check --nodelete --only "templates/*.json" --only "config/settings_data.json"
+
+          # Compare each file pulled from the live theme against the copy in this
+          # branch. $f is relative, so "$GITHUB_WORKSPACE/$f" is the repo version
+          # and "/tmp/check/$f" is what is live.
+          DRIFTED=""
+          for f in $(cd /tmp/check && find templates config -name '*.json' 2>/dev/null); do
+            REPO_FILE="$GITHUB_WORKSPACE/$f"
+            LIVE_FILE="/tmp/check/$f"
+            if [ ! -f "$REPO_FILE" ]; then
+              DRIFTED="${DRIFTED}${f} (exists live, absent from branch)"$'\n'
+            elif ! diff -q "$REPO_FILE" "$LIVE_FILE" >/dev/null 2>&1; then
+              DRIFTED="${DRIFTED}${f}"$'\n'
+            fi
+          done
+
+          if [ -n "$DRIFTED" ]; then
+            {
+              echo "### Live theme drift detected"
+              echo ""
+              echo "These files differ between the live theme and this branch."
+              echo "A merchandiser most likely changed them in the Shopify admin:"
+              echo ""
+              echo '```'
+              echo "$DRIFTED"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "drifted=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Live theme has content changes not present in this branch."
+          else
+            echo "drifted=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy
+        id: deploy
+        run: |
+          set -euo pipefail
+          shopify theme push --live --json > /tmp/deploy.json
+          THEME_ID=$(jq -r '.theme.id' /tmp/deploy.json)
+          echo "theme_id=$THEME_ID" >> "$GITHUB_OUTPUT"
+          echo "store_url=https://${SHOPIFY_FLAG_STORE}" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Slack
+        # `always()` so failures notify too. A deploy that works is not news;
+        # one that failed halfway needs to reach someone within minutes.
+        if: always()
+        uses: ./.github/actions/slack-notify
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          status: ${{ job.status }}
+          store-url: ${{ steps.deploy.outputs.store_url }}
+          rollback-name: ${{ steps.rollback.outputs.rollback_name }}
+          drifted: ${{ steps.drift.outputs.drifted }}
+          reason: ${{ inputs.reason }}

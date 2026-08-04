@@ -1,0 +1,19 @@
+display_information:
+  name: Deploy Bot
+  description: Deploy and preview notifications from GitHub Actions
+  background_color: "#1a1a1a"
+  long_description: Posts theme deploy events from the GitHub Actions pipeline into a designated channel. Reports successful releases, failed deploys, and pull requests opened automatically when a merchandiser changes something in the Shopify admin. Delivery is one-way via an incoming webhook; the app reads no messages and requires no user scopes.
+features:
+  bot_user:
+    display_name: Deploy Bot
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      # Incoming webhooks only. The app posts to one channel and can do nothing
+      # else: it cannot read messages, list channels, or see user data.
+      - incoming-webhook
+settings:
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false
