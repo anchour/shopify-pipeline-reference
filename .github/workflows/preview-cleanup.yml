@@ -26,7 +26,10 @@ jobs:
       SHOPIFY_FLAG_STORE: ${{ vars.SHOPIFY_STORE }}
       SHOPIFY_CLI_THEME_TOKEN: ${{ secrets.SHOPIFY_CLI_THEME_TOKEN }}
       SHOPIFY_CLI_TTY: 0
-      THEME_NAME: "PR#${{ github.event.pull_request.number }} preview"
+      # MUST match preview.yml exactly. Cleanup finds the theme by name, so any
+      # divergence between these two expressions orphans preview themes on the
+      # store until someone deletes them by hand.
+      THEME_NAME: "${{ vars.THEME_PREFIX || '[Preview]' }} PR #${{ github.event.pull_request.number }}"
 
     steps:
       - name: Install Shopify CLI
