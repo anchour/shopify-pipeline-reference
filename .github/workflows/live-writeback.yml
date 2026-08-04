@@ -55,8 +55,18 @@ jobs:
           git fetch origin "$LIVE_BRANCH" "$TARGET_BRANCH"
           git checkout -B "$DATA_BRANCH" "origin/$TARGET_BRANCH"
 
+          # sections/ is included for section group files such as
+          # sections/header-group.json, which hold header and footer
+          # configuration. The theme editor writes to them constantly, so
+          # omitting them would strand real merchandiser changes on the live
+          # branch.
           git checkout "origin/$LIVE_BRANCH" -- \
-            templates/ config/ locales/ 2>/dev/null || true
+            templates/ config/ locales/ sections/ 2>/dev/null || true
+
+          # Section .liquid files are source code, not content. Restore them from
+          # the target branch so only .json configuration travels back.
+          git reset -q -- 'sections/*.liquid' 2>/dev/null || true
+          git checkout -- 'sections/*.liquid' 2>/dev/null || true
 
           # Never let build output back into source.
           git reset -q -- 'assets/*' 'snippets/vite-tag.liquid' \
@@ -69,7 +79,7 @@ jobs:
             exit 0
           fi
 
-          git add templates/ config/ locales/ 2>/dev/null || true
+          git add templates/ config/ locales/ sections/ 2>/dev/null || true
           git commit -m "Merchandiser content from ${LIVE_BRANCH}"
           echo "changed=true" >> "$GITHUB_OUTPUT"
 

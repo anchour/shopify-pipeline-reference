@@ -110,9 +110,17 @@ jobs:
 
           # Only content files matter here. The live branch is always ahead on
           # build output, which is expected and not drift.
+          #
+          # sections/ is included deliberately. Section group files such as
+          # sections/header-group.json hold the header and footer configuration
+          # and the theme editor writes to them constantly. An earlier version of
+          # this check omitted them, and a real header colour change made in the
+          # admin passed straight through it. Only .json is matched, so section
+          # .liquid source is not treated as content.
           CHANGED=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE_BRANCH...$LIVE_BRANCH" \
             --jq '[.files[]?.filename
-                   | select(startswith("templates/") or startswith("config/") or startswith("locales/"))
+                   | select(startswith("templates/") or startswith("config/")
+                            or startswith("locales/") or startswith("sections/"))
                    | select(endswith(".json"))] | join("\n")')
 
           if [ -n "$CHANGED" ]; then
