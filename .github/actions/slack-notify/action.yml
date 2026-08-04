@@ -59,9 +59,6 @@ runs:
         case "$STATUS" in
           success)   EMOJI="🚀"; HEADING="Deploy succeeded"; COLOR="#2eb886" ;;
           failure)   EMOJI="🔴"; HEADING="Deploy FAILED";    COLOR="#d63a2f" ;;
-          # Not a failure. The pipeline did its job and refused to overwrite
-          # merchandiser content, so it reads as a warning rather than an alarm.
-          blocked)   EMOJI="🛑"; HEADING="Deploy blocked: unmerged live content"; COLOR="#e8a33d" ;;
           cancelled) EMOJI="⚪"; HEADING="Deploy cancelled"; COLOR="#9aa0a6" ;;
           *)         EMOJI="❓"; HEADING="Deploy finished: $STATUS"; COLOR="#9aa0a6" ;;
         esac
@@ -95,11 +92,6 @@ runs:
         if [ -n "${ROLLBACK_NAME}" ]; then
           BLOCKS=$(echo "$BLOCKS" | jq --arg r "$ROLLBACK_NAME" \
             '. + [ { type: "section", text: { type: "mrkdwn", text: ("*Rollback available*\nPublish theme `" + $r + "` to revert.") } } ]')
-        fi
-
-        if [ "$STATUS" = "blocked" ]; then
-          BLOCKS=$(echo "$BLOCKS" | jq \
-            '. + [ { type: "section", text: { type: "mrkdwn", text: "The live theme has content that is not in the repository, so the release was stopped before it could overwrite it. Merge the write-back pull request, then re-run the deploy." } } ]')
         fi
 
         if [ "$DRIFTED" = "true" ]; then

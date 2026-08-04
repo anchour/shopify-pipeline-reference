@@ -1,98 +1,99 @@
-# Shopify CI/CD pipeline reference
+# Dawn
 
-A working reference implementation of a Shopify theme deployment pipeline on
-GitHub Actions. The theme here is [Dawn](https://github.com/Shopify/dawn),
-unmodified and used only as a subject. **The workflows are the artifact.**
+[![Build status](https://github.com/shopify/dawn/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Shopify/dawn/actions/workflows/ci.yml?query=branch%3Amain)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?color=informational)](/.github/CONTRIBUTING.md)
 
-It exists so the pipeline design can be reviewed as something running rather
-than something described, and so it can be rehearsed against a disposable
-development store before being applied to a production storefront.
+[Getting started](#getting-started) |
+[Staying up to date with Dawn changes](#staying-up-to-date-with-dawn-changes) |
+[Developer tools](#developer-tools) |
+[Contributing](#contributing) |
+[Code of conduct](#code-of-conduct) |
+[Theme Store submission](#theme-store-submission) |
+[License](#license)
 
-## What it does
+Dawn represents a HTML-first, JavaScript-only-as-needed approach to theme development. It's Shopify's first source available theme with performance, flexibility, and [Online Store 2.0 features](https://www.shopify.com/partners/blog/shopify-online-store) built-in and acts as a reference for building Shopify themes.
 
-| Workflow | Trigger | Purpose |
-| --- | --- | --- |
-| `ci.yml` | Pull request, push to `main`/`develop` | Theme Check and linting. These are the required checks. |
-| `preview.yml` | Pull request opened or updated | Creates an unpublished preview theme, posts storefront and editor links |
-| `preview-cleanup.yml` | Pull request closed | Deletes the preview theme |
-| `deploy.yml` | Merge to `main`, or manual | Captures a rollback theme, checks for drift, publishes, notifies Slack |
+* **Web-native in its purest form:** Themes run on the [evergreen web](https://www.w3.org/2001/tag/doc/evergreen-web/). We leverage the latest web browsers to their fullest, while maintaining support for the older ones through progressive enhancement—not polyfills.
+* **Lean, fast, and reliable:** Functionality and design defaults to “no” until it meets this requirement. Code ships on quality. Themes must be built with purpose. They shouldn’t support each and every feature in Shopify.
+* **Server-rendered:** HTML must be rendered by Shopify servers using Liquid. Business logic and platform primitives such as translations and money formatting don’t belong on the client. Async and on-demand rendering of parts of the page is OK, but we do it sparingly as a progressive enhancement.
+* **Functional, not pixel-perfect:** The Web doesn’t require each page to be rendered pixel-perfect by each browser engine. Using semantic markup, progressive enhancement, and clever design, we ensure that themes remain functional regardless of the browser.
 
-`scripts/apply-branch-protection.sh` applies the protection model and hardens
-Actions permissions. It takes the repository as an argument, so the same script
-configures the rehearsal repo and the production one.
+You can find a more detailed version of our theme code principles in the [contribution guide](https://github.com/Shopify/dawn/blob/main/.github/CONTRIBUTING.md#theme-code-principles).
 
-## Design decisions
+## Getting started
+We recommend using Dawn as a starting point for theme development. [Learn more on Shopify.dev](https://shopify.dev/themes/getting-started/create).
 
-**Previews are per pull request, not per branch.** A pull request has a close
-event; a branch does not. Without one, every abandoned branch strands a theme
-against the store's theme limit. Previews are automatic with a `skip-preview`
-opt-out: forgetting a label should cost a wasted preview, not leave a reviewer
-with nothing to look at.
+> If you're building a theme for the Shopify Theme Store, then you can use Dawn as a starting point. However, the theme that you submit needs to be [substantively different from Dawn](https://shopify.dev/themes/store/requirements#uniqueness) so that it provides added value for merchants. Learn about the [ways that you can use Dawn](https://shopify.dev/themes/tools/dawn#ways-to-use-dawn).
 
-**A rollback theme is captured before every deploy.** Publishing a different
-theme in Shopify severs the GitHub connection on the theme that was live, so
-recovery is a documented multi-step process. Capturing a known-good copy first
-makes rollback "publish this theme" instead of "reconstruct the last good state
-under pressure."
+Please note that the main branch may include code for features not yet released. The "stable" version of Dawn is available in the theme store.
 
-**Live content drift is reported, never silently resolved.** Merchandisers edit
-content in the Shopify admin and those edits do not exist in the repository. A
-deploy that quietly overwrites them destroys someone's work with no error and no
-log line. This pipeline detects the difference and reports which files diverged.
+## Staying up to date with Dawn changes
 
-**Failures are loud.** The Slack step fails the job if Slack rejects the payload,
-and notifies on failure as well as success. A deploy that works is not news; a
-deploy that half-completed needs to reach someone within minutes.
+Say you're building a new theme off Dawn but you still want to be able to pull in the latest changes, you can add a remote `upstream` pointing to this Dawn repository.
 
-**Least privilege throughout.** Every workflow declares only the permissions it
-needs. The default repository token is read-only, and GitHub Actions cannot
-approve pull requests, so an approval requirement cannot be satisfied by
-automation.
-
-**CI never runs untrusted code with access to secrets.** Checks run on
-`pull_request`, not `pull_request_target`. The latter, combined with checking out
-pull-request head code, is a well-documented way to leak repository secrets to a
-fork.
-
-**Third-party actions are pinned to commit SHAs**, and the Shopify CLI version is
-declared once as a repository variable so a single pipeline cannot run two
-different Theme Check rule sets.
-
-## Configuration
-
-| Name | Type | Value |
-| --- | --- | --- |
-| `SHOPIFY_CLI_THEME_TOKEN` | secret | Theme Access token (`shptka_…`) |
-| `SLACK_WEBHOOK_URL` | secret | Slack incoming webhook URL |
-| `SHOPIFY_STORE` | variable | `your-store.myshopify.com` |
-| `SHOPIFY_CLI_VERSION` | variable | Optional. Defaults to `3.91.0`. |
-
-The Theme Access token comes from Shopify's first-party
-[Theme Access](https://apps.shopify.com/theme-access) app, which scopes a
-credential to themes only rather than requiring a staff account or a custom app
-with broad API access.
-
-For Slack, `docs/slack-app-manifest.yml` creates an app requesting exactly one
-scope, `incoming-webhook`. It can post to a single channel and cannot read
-messages, list channels, or see user data.
-
-## Branch protection
-
+1. Navigate to your local theme folder.
+2. Verify the list of remotes and validate that you have both an `origin` and `upstream`:
+```sh
+git remote -v
 ```
-./scripts/apply-branch-protection.sh owner/repo
+3. If you don't see an `upstream`, you can add one that points to Shopify's Dawn repository:
+```sh
+git remote add upstream https://github.com/Shopify/dawn.git
+```
+4. Pull in the latest Dawn changes into your repository:
+```sh
+git fetch upstream
+git pull upstream main
 ```
 
-Protects `main` and `develop`: pull request required, one approving review,
-stale reviews dismissed on push, approval required from someone other than the
-last pusher, required status checks, no force pushes, no deletion.
+## Developer tools
 
-Machine branches are deliberately left unprotected. Where Shopify's app writes
-merchandiser changes back to a connected branch and a release workflow recreates
-a build branch, blanket protection across all branches breaks the pipeline.
-Protect the branches humans merge into; leave the machine branches writable.
+There are a number of really useful tools that the Shopify Themes team uses during development. Dawn is already set up to work with these tools.
 
-Note: on GitHub Free, rulesets require a public repository.
+### Shopify CLI
 
-## Theme licence
+[Shopify CLI](https://github.com/Shopify/shopify-cli) helps you build Shopify themes faster and is used to automate and enhance your local development workflow. It comes bundled with a suite of commands for developing Shopify themes—everything from working with themes on a Shopify store (e.g. creating, publishing, deleting themes) or launching a development server for local theme development.
 
-Dawn is MIT licensed by Shopify. See `LICENSE.md`.
+You can follow this [quick start guide for theme developers](https://shopify.dev/docs/themes/tools/cli) to get started.
+
+### Theme Check
+
+We recommend using [Theme Check](https://github.com/shopify/theme-check) as a way to validate and lint your Shopify themes.
+
+We've added Theme Check to Dawn's [list of VS Code extensions](/.vscode/extensions.json) so if you're using Visual Studio Code as your code editor of choice, you'll be prompted to install the [Theme Check VS Code](https://marketplace.visualstudio.com/items?itemName=Shopify.theme-check-vscode) extension upon opening VS Code after you've forked and cloned Dawn.
+
+You can also run it from a terminal with the following Shopify CLI command:
+
+```bash
+shopify theme check
+```
+
+### Continuous Integration
+
+Dawn uses [GitHub Actions](https://github.com/features/actions) to maintain the quality of the theme. [This is a starting point](https://github.com/Shopify/dawn/blob/main/.github/workflows/ci.yml) and what we suggest to use in order to ensure you're building better themes. Feel free to build off of it!
+
+#### Shopify/lighthouse-ci-action
+
+We love fast websites! Which is why we created [Shopify/lighthouse-ci-action](https://github.com/Shopify/lighthouse-ci-action). This runs a series of [Google Lighthouse](https://developers.google.com/web/tools/lighthouse) audits for the home, product and collections pages on a store to ensure code that gets added doesn't degrade storefront performance over time.
+
+#### Shopify/theme-check-action
+
+Dawn runs [Theme Check](#Theme-Check) on every commit via [Shopify/theme-check-action](https://github.com/Shopify/theme-check-action).
+
+## Contributing
+
+Want to make commerce better for everyone by contributing to Dawn? We'd love your help! Please read our [contributing guide](https://github.com/Shopify/dawn/blob/main/.github/CONTRIBUTING.md) to learn about our development process, how to propose bug fixes and improvements, and how to build for Dawn.
+
+## Code of conduct
+
+All developers who wish to contribute through code or issues, please first read our [Code of Conduct](https://github.com/Shopify/dawn/blob/main/.github/CODE_OF_CONDUCT.md).
+
+## Theme Store submission
+
+The [Shopify Theme Store](https://themes.shopify.com/) is the place where Shopify merchants find the themes that they'll use to showcase and support their business. As a theme partner, you can create themes for the Shopify Theme Store and reach an international audience of an ever-growing number of entrepreneurs.
+
+Ensure that you follow the list of [theme store requirements](https://shopify.dev/themes/store/requirements) if you're interested in becoming a [Shopify Theme Partner](https://themes.shopify.com/services/themes/guidelines) and building themes for the Shopify platform.
+
+## License
+
+Copyright (c) 2021-present Shopify Inc. See [LICENSE](/LICENSE.md) for further details.
