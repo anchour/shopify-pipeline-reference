@@ -149,14 +149,47 @@ jobs:
         if: steps.collect.outputs.changed == 'true'
         run: git push --force-with-lease origin "$DATA_BRANCH"
 
+      # Uses a bot identity, not GITHUB_TOKEN.
+      #
+      # GitHub bundles "Actions can create pull requests" and "Actions can
+      # approve pull requests" behind a single setting. We deliberately turn that
+      # setting OFF, because an approval requirement that automation can satisfy
+      # is not a gate. The cost is that GITHUB_TOKEN cannot open this pull
+      # request either.
+      #
+      # A separate credential is the resolution rather than a workaround: it
+      # creates pull requests under its own identity, entirely outside that
+      # restriction, so the approval loophole stays closed. It also means these
+      # pull requests arrive from a named bot rather than the generic
+      # github-actions[bot], and the token can be scoped to one repository.
+      #
+      # This is why the pipeline being replaced carried its own bot token. That
+      # token needs replacing because it belongs to the outgoing partner, but the
+      # pattern itself is correct and has to be preserved.
       - name: Open or update the pull request
         if: steps.collect.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.WRITEBACK_TOKEN || secrets.GITHUB_TOKEN }}
+          HAS_BOT_TOKEN: ${{ secrets.WRITEBACK_TOKEN != '' }}
           FILES: ${{ steps.collect.outputs.files }}
           CODE: ${{ steps.collect.outputs.code }}
         run: |
           set -euo pipefail
+
+          # Say plainly why this will fail, rather than letting the GraphQL error
+          # surface with no context. The data branch has already been pushed at
+          # this point, so the content is safe either way and a human can open
+          # the pull request by hand.
+          if [ "$HAS_BOT_TOKEN" != "true" ]; then
+            echo "::error::WRITEBACK_TOKEN is not set."
+            echo "GITHUB_TOKEN cannot open pull requests while Actions are barred from"
+            echo "creating and approving them, which is a setting we keep enabled so"
+            echo "that automation cannot satisfy an approval requirement."
+            echo ""
+            echo "Changes are safe on $DATA_BRANCH. Open a pull request from it manually,"
+            echo "or set WRITEBACK_TOKEN and re-run this workflow."
+            exit 1
+          fi
 
           EXISTING=$(gh pr list --repo "$GITHUB_REPOSITORY" \
             --head "$DATA_BRANCH" --state open --json number --jq '.[0].number // ""')
