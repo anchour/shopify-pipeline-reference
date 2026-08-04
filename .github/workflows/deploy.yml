@@ -123,7 +123,12 @@ jobs:
         id: deploy
         run: |
           set -euo pipefail
-          shopify theme push --live --json > /tmp/deploy.json
+          # --allow-live is required in CI. The CLI prompts for confirmation
+          # before overwriting a published theme, and with no TTY that prompt
+          # fails the command rather than defaulting to yes. Defeating the guard
+          # has to be explicit, which is the right design: publishing over a live
+          # storefront should never happen because a flag was omitted.
+          shopify theme push --live --allow-live --json > /tmp/deploy.json
           THEME_ID=$(jq -r '.theme.id' /tmp/deploy.json)
           echo "theme_id=$THEME_ID" >> "$GITHUB_OUTPUT"
           echo "store_url=https://${SHOPIFY_FLAG_STORE}" >> "$GITHUB_OUTPUT"
