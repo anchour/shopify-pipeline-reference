@@ -146,13 +146,47 @@ jobs:
           # live-writeback.yml.
           git fetch -q origin "$BASE_BRANCH" "$LIVE_BRANCH"
 
+          # DIRECTION MATTERS.
+          #
+          # A plain diff between the branches answers "do these differ", which is
+          # the wrong question. Every pending release makes them differ: that is
+          # what deploying is. Blocking on it meant the gate refused to run
+          # precisely when there was something to release.
+          #
+          # The question is narrower: does the live branch carry anything the
+          # repository does not have? Only then is a release destructive.
+          #
+          # So look for commits that exist on the live branch and not on the base
+          # branch, and take the files they touched. Where main is ahead, there
+          # are no such commits and the gate passes, correctly.
+          LIVE_ONLY=$(git log --format=%H "origin/$BASE_BRANCH..origin/$LIVE_BRANCH")
+
+          if [ -z "$LIVE_ONLY" ]; then
+            echo "Live branch has no commits of its own. Nothing to reconcile."
+            exit 0
+          fi
+
           CHANGED=$(git diff --name-only \
-            "origin/$BASE_BRANCH" "origin/$LIVE_BRANCH" -- \
+            "origin/$BASE_BRANCH...origin/$LIVE_BRANCH" -- \
             assets blocks config layout locales sections snippets templates \
             | grep -vE '^assets/.*\.(asset|bundle|chunk)\.' \
             | grep -vE '^assets/(manifest\.json|runtime\.js)$' \
             | grep -vE '^snippets/(vite-tag|script-tags|style-tags)\.liquid$' \
             || true)
+
+          # Of those, keep only files whose content actually still differs. A file
+          # touched on the live branch and since reconciled by a merged write-back
+          # is not drift, which is the false positive fixed earlier.
+          if [ -n "$CHANGED" ]; then
+            STILL_DIFFERENT=""
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              if ! git diff --quiet "origin/$BASE_BRANCH" "origin/$LIVE_BRANCH" -- "$f"; then
+                STILL_DIFFERENT="${STILL_DIFFERENT}${f}"$'\n'
+              fi
+            done <<< "$CHANGED"
+            CHANGED=$(printf '%s' "$STILL_DIFFERENT")
+          fi
 
           if [ -n "$CHANGED" ]; then
             {

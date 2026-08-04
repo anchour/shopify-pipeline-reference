@@ -89,13 +89,32 @@ jobs:
           # and live-writeback.yml.
           git fetch -q origin "$BASE_BRANCH" "$LIVE_BRANCH"
 
-          CHANGED=$(git diff --name-only \
-            "origin/$BASE_BRANCH" "origin/$LIVE_BRANCH" -- \
-            assets blocks config layout locales sections snippets templates \
-            | grep -vE '^assets/.*\.(asset|bundle|chunk)\.' \
-            | grep -vE '^assets/(manifest\.json|runtime\.js)$' \
-            | grep -vE '^snippets/(vite-tag|script-tags|style-tags)\.liquid$' \
-            || true)
+          # Only commits unique to the live branch count. A pending release makes
+          # the branches differ by design, and reporting that as drift would warn
+          # on every open pull request that had anything to deploy. See the fuller
+          # explanation in deploy.yml.
+          LIVE_ONLY=$(git log --format=%H "origin/$BASE_BRANCH..origin/$LIVE_BRANCH")
+
+          CHANGED=""
+          if [ -n "$LIVE_ONLY" ]; then
+            TOUCHED=$(git diff --name-only \
+              "origin/$BASE_BRANCH...origin/$LIVE_BRANCH" -- \
+              assets blocks config layout locales sections snippets templates \
+              | grep -vE '^assets/.*\.(asset|bundle|chunk)\.' \
+              | grep -vE '^assets/(manifest\.json|runtime\.js)$' \
+              | grep -vE '^snippets/(vite-tag|script-tags|style-tags)\.liquid$' \
+              || true)
+
+            # Keep only files whose content still differs, so content already
+            # reconciled by a merged write-back does not keep being reported.
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              if ! git diff --quiet "origin/$BASE_BRANCH" "origin/$LIVE_BRANCH" -- "$f"; then
+                CHANGED="${CHANGED}${f}"$'\n'
+              fi
+            done <<< "$TOUCHED"
+            CHANGED=$(printf '%s' "$CHANGED")
+          fi
 
           # Which pull requests need a comment.
           if [ -n "${PR_NUMBER:-}" ]; then
