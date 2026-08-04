@@ -1,0 +1,130 @@
+# Brings merchandiser changes back into the repository.
+#
+# Shopify commits to the connected branch whenever the theme is changed in the
+# admin, and per Shopify's documentation this "can't be disabled". Those commits
+# are real content: theme editor settings, section arrangement, template JSON.
+#
+# Without a return path that content exists only on the live branch, and the next
+# release merges over it. This workflow raises it as a pull request so a human
+# sees what Shopify wrote before it enters the development branches.
+#
+# The deploy workflow refuses to run while one of these pull requests is open.
+name: Live writeback
+
+on:
+  push:
+    branches: [main-live]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: live-writeback
+
+env:
+  LIVE_BRANCH: main-live
+  DATA_BRANCH: main-live-data
+  TARGET_BRANCH: develop
+
+jobs:
+  writeback:
+    name: Raise write-back pull request
+    # Only Shopify's own commits. A push from the deploy workflow is our own
+    # release and must not loop back into a pull request.
+    if: github.event.pusher.name == 'shopify[bot]' || github.event.sender.login == 'shopify[bot]'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.DEPLOY_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # Carry across content only. Compiled assets live on the live branch by
+      # design and must not flow back into source, where they are gitignored.
+      - name: Collect content changes
+        id: collect
+        run: |
+          set -euo pipefail
+          git fetch origin "$LIVE_BRANCH" "$TARGET_BRANCH"
+          git checkout -B "$DATA_BRANCH" "origin/$TARGET_BRANCH"
+
+          git checkout "origin/$LIVE_BRANCH" -- \
+            templates/ config/ locales/ 2>/dev/null || true
+
+          # Never let build output back into source.
+          git reset -q -- 'assets/*' 'snippets/vite-tag.liquid' \
+            'snippets/script-tags.liquid' 'snippets/style-tags.liquid' 2>/dev/null || true
+          git checkout -- 'assets/*' 2>/dev/null || true
+
+          if git diff --cached --quiet && git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No content changes to bring back."
+            exit 0
+          fi
+
+          git add templates/ config/ locales/ 2>/dev/null || true
+          git commit -m "Merchandiser content from ${LIVE_BRANCH}"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+          FILES=$(git diff --name-only "origin/$TARGET_BRANCH"..HEAD | head -20)
+          {
+            echo 'files<<EOF'
+            echo "$FILES"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # force-with-lease, not force. If someone else has pushed to the data
+      # branch since we read it, the push is refused rather than discarding their
+      # work.
+      #
+      # DEFECT FIXED (inherited pipeline: live-data-pr.yml)
+      # The original ended its push chain with `|| echo "Nothing to commit"`,
+      # which caught every failure and exited zero. A rejected push looked exactly
+      # like a clean no-op, so a broken write-back could go unnoticed indefinitely.
+      - name: Push data branch
+        if: steps.collect.outputs.changed == 'true'
+        run: git push --force-with-lease origin "$DATA_BRANCH"
+
+      - name: Open or update the pull request
+        if: steps.collect.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FILES: ${{ steps.collect.outputs.files }}
+        run: |
+          set -euo pipefail
+
+          EXISTING=$(gh pr list --repo "$GITHUB_REPOSITORY" \
+            --head "$DATA_BRANCH" --state open --json number --jq '.[0].number // ""')
+
+          BODY=$(cat <<EOF
+          Shopify committed these changes to \`$LIVE_BRANCH\` after someone edited
+          the theme in the Shopify admin.
+
+          Merge this so the content is in the repository. **The deploy workflow will
+          refuse to run while this pull request is open**, because releasing without
+          it would overwrite this content.
+
+          Changed files:
+
+          \`\`\`
+          $FILES
+          \`\`\`
+          EOF
+          )
+
+          if [ -n "$EXISTING" ]; then
+            gh pr edit "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+            echo "::notice::Updated existing write-back pull request #$EXISTING."
+          else
+            gh pr create --repo "$GITHUB_REPOSITORY" \
+              --base "$TARGET_BRANCH" --head "$DATA_BRANCH" \
+              --title "Merchandiser content from $LIVE_BRANCH" \
+              --body "$BODY" --label live-data
+          fi

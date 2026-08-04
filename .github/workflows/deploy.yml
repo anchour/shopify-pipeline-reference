@@ -1,17 +1,29 @@
-# Publishes the theme when a pull request merges to main, then notifies Slack.
+# Release deploy.
 #
-# The inherited pipeline used a three-branch dance (main, main-built, main-live)
-# because Shopify writes merchandiser changes back to the connected branch. That
-# structure is sound and is retained in the production design. This rehearsal
-# deploys directly, so the moving parts under test are the deploy, the failure
-# path, and the notification rather than the branch topology.
+# HOW A CHANGE REACHES THE STOREFRONT
+#
+# The live theme is CONNECTED to the live branch through Shopify's GitHub
+# integration. Shopify watches that branch and applies commits itself. Nothing
+# here runs `shopify theme push` against the live theme: the deploy is a git
+# push, and Shopify does the publishing.
+#
+# The integration runs no build step. Shopify's documentation is explicit that
+# it supports "a buildless theme, or a theme that has already gone through any
+# necessary file transformations". Since this theme is built with Vite and the
+# build output is gitignored, the live branch has to carry source AND compiled
+# assets. That is the entire reason a separate built branch exists.
+#
+#   main         source of truth, build output gitignored
+#   main-live    connected to the live theme, carries source + build output.
+#                Shopify writes merchandiser changes back here.
+#   main-built   transient. main-live + main + a fresh build, merged to main-live.
+#
 name: Deploy
 
 on:
   pull_request:
     types: [closed]
     branches: [main]
-  # Manual trigger so a rollback can be run without inventing a commit.
   workflow_dispatch:
     inputs:
       reason:
@@ -20,128 +32,240 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: read
 
-# Never run two deploys at once, and never cancel one midway: a half-applied
-# theme push is the state we most want to avoid.
 concurrency:
   group: deploy-production
   cancel-in-progress: false
 
-jobs:
-  deploy:
-    name: Deploy to production
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+env:
+  BASE_BRANCH: main
+  LIVE_BRANCH: main-live
+  BUILT_BRANCH: main-built
+  DATA_BRANCH: main-live-data
 
-    env:
-      SHOPIFY_FLAG_STORE: ${{ vars.SHOPIFY_STORE }}
-      SHOPIFY_CLI_THEME_TOKEN: ${{ secrets.SHOPIFY_CLI_THEME_TOKEN }}
-      SHOPIFY_CLI_TTY: 0
+jobs:
+  # ── Gate ────────────────────────────────────────────────────────────────────
+  #
+  # Refuse to deploy while merchandiser content sits unmerged.
+  #
+  # Shopify commits theme-editor changes to the live branch, and a separate
+  # workflow raises those as a pull request back into the development branches.
+  # If that pull request has not been merged, the live branch holds content the
+  # repository does not have. Deploying anyway merges over it.
+  #
+  # The inherited pipeline merged with `-X theirs`, meaning the repository won
+  # every conflict silently. Weeks of merchandiser work could disappear with no
+  # error and no log line. This job is the structural fix: the deploy does not
+  # start until the content is reconciled.
+  check-writeback:
+    name: Check for unmerged live content
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    steps:
+      - name: Block on open write-back pull requests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          OPEN=$(gh pr list --repo "$GITHUB_REPOSITORY" \
+            --label live-data --state open \
+            --json number,title,createdAt \
+            --jq '.[] | "  #\(.number)  \(.createdAt[0:10])  \(.title)"')
+
+          if [ -n "$OPEN" ]; then
+            {
+              echo "### Deploy blocked: unmerged live content"
+              echo ""
+              echo "These write-back pull requests carry merchandiser changes that are"
+              echo "not yet in the repository. Deploying now would overwrite them."
+              echo ""
+              echo '```'
+              echo "$OPEN"
+              echo '```'
+              echo ""
+              echo "Merge them, then re-run this deploy."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Open write-back pull request(s). Merge before deploying."
+            echo "$OPEN"
+            exit 1
+          fi
+          echo "No open write-back pull requests."
+
+      # A pull request is not the only way content can be sitting unmerged.
+      # Compare the branches directly so a deleted, closed, or never-created
+      # pull request cannot hide real divergence.
+      - name: Compare live branch against base
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if ! gh api "repos/$GITHUB_REPOSITORY/branches/$LIVE_BRANCH" --silent 2>/dev/null; then
+            echo "::notice::$LIVE_BRANCH does not exist yet. Nothing to compare."
+            exit 0
+          fi
+
+          # Only content files matter here. The live branch is always ahead on
+          # build output, which is expected and not drift.
+          CHANGED=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE_BRANCH...$LIVE_BRANCH" \
+            --jq '[.files[]?.filename
+                   | select(startswith("templates/") or startswith("config/") or startswith("locales/"))
+                   | select(endswith(".json"))] | join("\n")')
+
+          if [ -n "$CHANGED" ]; then
+            {
+              echo "### Deploy blocked: live content not in the repository"
+              echo ""
+              echo "These content files differ on \`$LIVE_BRANCH\`:"
+              echo ""
+              echo '```'
+              echo "$CHANGED"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Live content not reconciled. See the run summary."
+            exit 1
+          fi
+          echo "Live branch content matches the repository."
+
+  # ── Deploy ──────────────────────────────────────────────────────────────────
+  deploy:
+    name: Build and release
+    needs: check-writeback
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          token: ${{ secrets.DEPLOY_TOKEN || secrets.GITHUB_TOKEN }}
 
-      - name: Install Shopify CLI
-        run: npm install -g @shopify/cli@${{ vars.SHOPIFY_CLI_VERSION || '3.91.0' }}
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config pull.rebase false
 
-      # Rollback theme, taken BEFORE anything is changed.
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version-file: package.json
+          cache: npm
+
+      # Start from the live branch so merchandiser content is the base, then
+      # bring in the code. The check-writeback job has already established that
+      # there is no unreconciled content, so this merge should be clean.
       #
-      # Publishing a different theme in Shopify severs the GitHub connection on
-      # the theme that was live, so recovery is a documented multi-step process.
-      # Capturing a known-good copy first turns rollback into "publish this
-      # theme" instead of "reconstruct the last good state under pressure".
-      - name: Capture rollback theme
-        id: rollback
+      # DEFECT FIXED (inherited pipeline: deploy-release.yml)
+      # The original used `git merge $BASE_BRANCH -X theirs`, which resolves every
+      # conflict in favour of the repository without reporting it. Halt instead,
+      # and say which files are in conflict.
+      - name: Assemble the built branch
         run: |
           set -euo pipefail
-          STAMP=$(date -u +%Y%m%d-%H%M%S)
-          NAME="rollback-${STAMP}"
+          git fetch origin "$LIVE_BRANCH" "$BASE_BRANCH"
 
-          # Pull what is live right now, then park it as an unpublished theme.
-          mkdir -p /tmp/live
-          shopify theme pull --live --path /tmp/live --nodelete
-          shopify theme push \
-            --unpublished \
-            --theme "$NAME" \
-            --path /tmp/live \
-            --json > /tmp/rollback.json
+          git checkout -B "$BUILT_BRANCH" "origin/$LIVE_BRANCH"
 
-          ROLLBACK_ID=$(jq -r '.theme.id' /tmp/rollback.json)
-          echo "rollback_id=$ROLLBACK_ID" >> "$GITHUB_OUTPUT"
-          echo "rollback_name=$NAME" >> "$GITHUB_OUTPUT"
-          echo "::notice::Rollback theme $NAME (id $ROLLBACK_ID) captured."
-
-      # DEFECT FIXED (inherited pipeline: deploy-release.yml)
-      # The original merged with `-X theirs`, so on conflict the repository
-      # version silently overwrote merchandiser content that Shopify had written
-      # to the live branch. Someone's work disappeared with no error and no log
-      # line. Detect drift and report it instead of resolving it silently.
-      - name: Check for live drift
-        id: drift
-        continue-on-error: true
-        run: |
-          set -uo pipefail
-          mkdir -p /tmp/check
-          shopify theme pull --live --path /tmp/check --nodelete --only "templates/*.json" --only "config/settings_data.json"
-
-          # Compare each file pulled from the live theme against the copy in this
-          # branch. $f is relative, so "$GITHUB_WORKSPACE/$f" is the repo version
-          # and "/tmp/check/$f" is what is live.
-          DRIFTED=""
-          for f in $(cd /tmp/check && find templates config -name '*.json' 2>/dev/null); do
-            REPO_FILE="$GITHUB_WORKSPACE/$f"
-            LIVE_FILE="/tmp/check/$f"
-            if [ ! -f "$REPO_FILE" ]; then
-              DRIFTED="${DRIFTED}${f} (exists live, absent from branch)"$'\n'
-            elif ! diff -q "$REPO_FILE" "$LIVE_FILE" >/dev/null 2>&1; then
-              DRIFTED="${DRIFTED}${f}"$'\n'
-            fi
-          done
-
-          if [ -n "$DRIFTED" ]; then
+          if ! git merge "origin/$BASE_BRANCH" --no-edit; then
+            CONFLICTS=$(git diff --name-only --diff-filter=U)
             {
-              echo "### Live theme drift detected"
+              echo "### Deploy halted: merge conflict"
               echo ""
-              echo "These files differ between the live theme and this branch."
-              echo "A merchandiser most likely changed them in the Shopify admin:"
+              echo "Conflicts between the live branch and the repository:"
               echo ""
               echo '```'
-              echo "$DRIFTED"
+              echo "$CONFLICTS"
               echo '```'
+              echo ""
+              echo "Resolve these deliberately. The previous pipeline resolved them"
+              echo "automatically in favour of the repository, which silently discarded"
+              echo "merchandiser content."
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "drifted=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::Live theme has content changes not present in this branch."
-          else
-            echo "drifted=false" >> "$GITHUB_OUTPUT"
+            echo "::error::Merge conflict. See the run summary."
+            git merge --abort
+            exit 1
           fi
 
-      - name: Deploy
-        id: deploy
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # Assert the build actually produced what the theme needs, rather than
+      # trusting a zero exit code.
+      #
+      # The theme renders assets through a generated snippet. In development that
+      # snippet points at a local Vite dev server. If a stale or missing snippet
+      # reached the live branch, every component depending on it would silently
+      # fail to load, and Theme Check would not catch it because the file is
+      # gitignored and excluded from linting.
+      - name: Verify build output
         run: |
           set -euo pipefail
-          # --allow-live is required in CI. The CLI prompts for confirmation
-          # before overwriting a published theme, and with no TTY that prompt
-          # fails the command rather than defaulting to yes. Defeating the guard
-          # has to be explicit, which is the right design: publishing over a live
-          # storefront should never happen because a flag was omitted.
-          shopify theme push --live --allow-live --json > /tmp/deploy.json
-          THEME_ID=$(jq -r '.theme.id' /tmp/deploy.json)
-          echo "theme_id=$THEME_ID" >> "$GITHUB_OUTPUT"
-          echo "store_url=https://${SHOPIFY_FLAG_STORE}" >> "$GITHUB_OUTPUT"
+          MISSING=0
+
+          for f in snippets/vite-tag.liquid assets/manifest.json; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Build did not produce $f"
+              MISSING=1
+            fi
+          done
+          [ "$MISSING" -eq 1 ] && exit 1
+
+          # A production build must not reference a local dev server.
+          if grep -qE 'localhost:[0-9]+|127\.0\.0\.1' snippets/vite-tag.liquid; then
+            echo "::error::vite-tag.liquid references a local dev server. This is a development build."
+            grep -nE 'localhost:[0-9]+|127\.0\.0\.1' snippets/vite-tag.liquid | head -5
+            exit 1
+          fi
+
+          echo "Build output verified."
+
+      # The live branch must carry compiled assets, which are gitignored in the
+      # repository. Force-add exactly the build output rather than replacing
+      # .gitignore wholesale.
+      #
+      # DEFECT FIXED (inherited pipeline: deploy-release.yml)
+      # The original overwrote .gitignore with "node_modules/" and ran `git add -A`,
+      # which sweeps in anything else present in the working tree, including files
+      # that were gitignored for good reason.
+      - name: Commit build output
+        run: |
+          set -euo pipefail
+          git add --force \
+            assets/manifest.json \
+            assets/*.asset.* assets/*.bundle.* assets/*.chunk.* \
+            assets/runtime.js \
+            snippets/vite-tag.liquid \
+            snippets/script-tags.liquid \
+            snippets/style-tags.liquid \
+            2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "::warning::Build produced no changes to commit."
+          else
+            git commit -m "Build output for ${GITHUB_SHA:0:7}"
+          fi
+
+      # The push Shopify is watching. This is the deploy.
+      - name: Release to the live branch
+        id: release
+        run: |
+          set -euo pipefail
+          git checkout "$BUILT_BRANCH"
+          git push origin "HEAD:$LIVE_BRANCH"
+          echo "released=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::Pushed to $LIVE_BRANCH. Shopify will apply it to the live theme."
 
       - name: Notify Slack
-        # `always()` so failures notify too. A deploy that works is not news;
-        # one that failed halfway needs to reach someone within minutes.
         if: always()
         uses: ./.github/actions/slack-notify
         with:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           status: ${{ job.status }}
-          store-url: ${{ steps.deploy.outputs.store_url }}
-          rollback-name: ${{ steps.rollback.outputs.rollback_name }}
-          drifted: ${{ steps.drift.outputs.drifted }}
+          store-url: ${{ vars.SHOPIFY_STORE && format('https://{0}', vars.SHOPIFY_STORE) || '' }}
           reason: ${{ inputs.reason }}
