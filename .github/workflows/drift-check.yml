@@ -55,6 +55,12 @@ jobs:
     name: Live content drift
     runs-on: ubuntu-latest
     steps:
+      # Needed so the comparison below can diff the branches directly.
+      # Read-only: this job only posts comments, it never changes the repository.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
       # One shared script for both triggers. On a pull_request event it reports
       # on that pull request; on a push to the live branch it reports on every
       # open pull request targeting main.
@@ -71,25 +77,44 @@ jobs:
             exit 0
           fi
 
-          # Everything counts as drift except two categories.
+          # Compare the two branches as they stand right now.
           #
-          # Compiled Vite output lives on the live branch by design and differs
-          # on every release.
+          # This previously used the compare API with `base...head`, which is a
+          # merge-base comparison: it reports what changed since the branches
+          # diverged, not what differs today. After a write-back was merged the
+          # branches held identical content, yet those files were still listed.
+          # See the same fix in deploy.yml.
           #
-          # .github/ is CI configuration, never theme content. Shopify does not
-          # write to it, so a difference there is always the repository being
-          # ahead, not merchandiser work at risk. Including it produced comments
-          # telling reviewers to merge a write-back pull request for workflow
-          # files that no write-back would ever contain.
-          # Positive match on Shopify's theme directories. Must stay in step with
-          # the same filter in deploy.yml and live-writeback.yml.
-          CHANGED=$(gh api "repos/$REPO/compare/$BASE_BRANCH...$LIVE_BRANCH" \
-            --jq '[.files[]?.filename
-                   | select(test("^(assets|blocks|config|layout|locales|sections|snippets|templates)/"))
-                   | select(test("^assets/.*\\.(asset|bundle|chunk)\\.") | not)
-                   | select(. != "assets/manifest.json" and . != "assets/runtime.js")
-                   | select(test("^snippets/(vite-tag|script-tags|style-tags)\\.liquid$") | not)
-                  ] | join("\n")')
+          # Theme directories matched positively. Keep in step with deploy.yml
+          # and live-writeback.yml.
+          git fetch -q origin "$BASE_BRANCH" "$LIVE_BRANCH"
+
+          # Only commits unique to the live branch count. A pending release makes
+          # the branches differ by design, and reporting that as drift would warn
+          # on every open pull request that had anything to deploy. See the fuller
+          # explanation in deploy.yml.
+          LIVE_ONLY=$(git log --format=%H "origin/$BASE_BRANCH..origin/$LIVE_BRANCH")
+
+          CHANGED=""
+          if [ -n "$LIVE_ONLY" ]; then
+            TOUCHED=$(git diff --name-only \
+              "origin/$BASE_BRANCH...origin/$LIVE_BRANCH" -- \
+              assets blocks config layout locales sections snippets templates \
+              | grep -vE '^assets/.*\.(asset|bundle|chunk)\.' \
+              | grep -vE '^assets/(manifest\.json|runtime\.js)$' \
+              | grep -vE '^snippets/(vite-tag|script-tags|style-tags)\.liquid$' \
+              || true)
+
+            # Keep only files whose content still differs, so content already
+            # reconciled by a merged write-back does not keep being reported.
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              if ! git diff --quiet "origin/$BASE_BRANCH" "origin/$LIVE_BRANCH" -- "$f"; then
+                CHANGED="${CHANGED}${f}"$'\n'
+              fi
+            done <<< "$TOUCHED"
+            CHANGED=$(printf '%s' "$CHANGED")
+          fi
 
           # Which pull requests need a comment.
           if [ -n "${PR_NUMBER:-}" ]; then

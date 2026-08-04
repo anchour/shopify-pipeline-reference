@@ -64,6 +64,12 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
     steps:
+      # Needed so the comparison below can diff the two branches directly.
+      # This job is read-only: it never commits, pushes, or merges.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
       - name: Block on open write-back pull requests
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -120,18 +126,67 @@ jobs:
           # design, and .github/, which is CI configuration that Shopify never
           # writes to. A difference under .github/ means the repository is ahead,
           # not that merchandiser work is at risk.
-          # Match Shopify's theme directories positively rather than excluding
-          # everything else. Anything outside them cannot be a merchandiser edit,
-          # and an exclusion list has to anticipate every non-theme file that
-          # might differ, which it will eventually fail to do. This must stay in
-          # step with the directory list in live-writeback.yml.
-          CHANGED=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE_BRANCH...$LIVE_BRANCH" \
-            --jq '[.files[]?.filename
-                   | select(test("^(assets|blocks|config|layout|locales|sections|snippets|templates)/"))
-                   | select(test("^assets/.*\\.(asset|bundle|chunk)\\.") | not)
-                   | select(. != "assets/manifest.json" and . != "assets/runtime.js")
-                   | select(test("^snippets/(vite-tag|script-tags|style-tags)\\.liquid$") | not)
-                  ] | join("\n")')
+          # Compare the two branches as they stand right now.
+          #
+          # This previously used the compare API with `base...head`. Three-dot
+          # syntax is a MERGE-BASE comparison: it reports what changed on either
+          # branch since they last diverged, not what differs between them today.
+          # Once a write-back pull request was merged, the branches held identical
+          # content but the API still listed those files, because they had changed
+          # at some point after the fork. The gate blocked on drift that had
+          # already been reconciled.
+          #
+          # git diff between the two refs answers the question the gate actually
+          # asks: is there anything on the live branch that is not in the
+          # repository right now.
+          #
+          # Theme directories are matched positively. Anything outside them cannot
+          # be a merchandiser edit, and an exclusion list has to anticipate every
+          # non-theme file that might differ. Keep this list in step with
+          # live-writeback.yml.
+          git fetch -q origin "$BASE_BRANCH" "$LIVE_BRANCH"
+
+          # DIRECTION MATTERS.
+          #
+          # A plain diff between the branches answers "do these differ", which is
+          # the wrong question. Every pending release makes them differ: that is
+          # what deploying is. Blocking on it meant the gate refused to run
+          # precisely when there was something to release.
+          #
+          # The question is narrower: does the live branch carry anything the
+          # repository does not have? Only then is a release destructive.
+          #
+          # So look for commits that exist on the live branch and not on the base
+          # branch, and take the files they touched. Where main is ahead, there
+          # are no such commits and the gate passes, correctly.
+          LIVE_ONLY=$(git log --format=%H "origin/$BASE_BRANCH..origin/$LIVE_BRANCH")
+
+          if [ -z "$LIVE_ONLY" ]; then
+            echo "Live branch has no commits of its own. Nothing to reconcile."
+            exit 0
+          fi
+
+          CHANGED=$(git diff --name-only \
+            "origin/$BASE_BRANCH...origin/$LIVE_BRANCH" -- \
+            assets blocks config layout locales sections snippets templates \
+            | grep -vE '^assets/.*\.(asset|bundle|chunk)\.' \
+            | grep -vE '^assets/(manifest\.json|runtime\.js)$' \
+            | grep -vE '^snippets/(vite-tag|script-tags|style-tags)\.liquid$' \
+            || true)
+
+          # Of those, keep only files whose content actually still differs. A file
+          # touched on the live branch and since reconciled by a merged write-back
+          # is not drift, which is the false positive fixed earlier.
+          if [ -n "$CHANGED" ]; then
+            STILL_DIFFERENT=""
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              if ! git diff --quiet "origin/$BASE_BRANCH" "origin/$LIVE_BRANCH" -- "$f"; then
+                STILL_DIFFERENT="${STILL_DIFFERENT}${f}"$'\n'
+              fi
+            done <<< "$CHANGED"
+            CHANGED=$(printf '%s' "$STILL_DIFFERENT")
+          fi
 
           if [ -n "$CHANGED" ]; then
             {
@@ -166,11 +221,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config pull.rebase false
-
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
-        with:
-          node-version-file: package.json
-          cache: npm
 
       # Start from the live branch so merchandiser content is the base, then
       # bring in the code. The check-writeback job has already established that
@@ -207,10 +257,38 @@ jobs:
             exit 1
           fi
 
+      # Whether this theme has a build at all.
+      #
+      # Shopify's integration explicitly supports "a buildless theme, or a theme
+      # that has already gone through any necessary file transformations", so a
+      # theme with no package.json is a legitimate configuration and must deploy
+      # rather than fail. Dawn, used here as the rehearsal subject, is one.
+      #
+      # Detected after the branches are assembled, so it reflects what is
+      # actually being released rather than whatever the initial checkout held.
+      - name: Detect build
+        id: build
+        run: |
+          if [ -f package.json ] && jq -e '.scripts.build' package.json >/dev/null 2>&1; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Build script found. Building before release."
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No build script. Releasing theme files as they are."
+          fi
+
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        if: steps.build.outputs.present == 'true'
+        with:
+          node-version-file: package.json
+          cache: npm
+
       - name: Install dependencies
+        if: steps.build.outputs.present == 'true'
         run: npm ci
 
       - name: Build
+        if: steps.build.outputs.present == 'true'
         run: npm run build
 
       # Assert the build actually produced what the theme needs, rather than
@@ -222,6 +300,7 @@ jobs:
       # fail to load, and Theme Check would not catch it because the file is
       # gitignored and excluded from linting.
       - name: Verify build output
+        if: steps.build.outputs.present == 'true'
         run: |
           set -euo pipefail
           MISSING=0
@@ -252,6 +331,7 @@ jobs:
       # which sweeps in anything else present in the working tree, including files
       # that were gitignored for good reason.
       - name: Commit build output
+        if: steps.build.outputs.present == 'true'
         run: |
           set -euo pipefail
           git add --force \
