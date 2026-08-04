@@ -64,6 +64,12 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
     steps:
+      # Needed so the comparison below can diff the two branches directly.
+      # This job is read-only: it never commits, pushes, or merges.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
       - name: Block on open write-back pull requests
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -120,18 +126,33 @@ jobs:
           # design, and .github/, which is CI configuration that Shopify never
           # writes to. A difference under .github/ means the repository is ahead,
           # not that merchandiser work is at risk.
-          # Match Shopify's theme directories positively rather than excluding
-          # everything else. Anything outside them cannot be a merchandiser edit,
-          # and an exclusion list has to anticipate every non-theme file that
-          # might differ, which it will eventually fail to do. This must stay in
-          # step with the directory list in live-writeback.yml.
-          CHANGED=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE_BRANCH...$LIVE_BRANCH" \
-            --jq '[.files[]?.filename
-                   | select(test("^(assets|blocks|config|layout|locales|sections|snippets|templates)/"))
-                   | select(test("^assets/.*\\.(asset|bundle|chunk)\\.") | not)
-                   | select(. != "assets/manifest.json" and . != "assets/runtime.js")
-                   | select(test("^snippets/(vite-tag|script-tags|style-tags)\\.liquid$") | not)
-                  ] | join("\n")')
+          # Compare the two branches as they stand right now.
+          #
+          # This previously used the compare API with `base...head`. Three-dot
+          # syntax is a MERGE-BASE comparison: it reports what changed on either
+          # branch since they last diverged, not what differs between them today.
+          # Once a write-back pull request was merged, the branches held identical
+          # content but the API still listed those files, because they had changed
+          # at some point after the fork. The gate blocked on drift that had
+          # already been reconciled.
+          #
+          # git diff between the two refs answers the question the gate actually
+          # asks: is there anything on the live branch that is not in the
+          # repository right now.
+          #
+          # Theme directories are matched positively. Anything outside them cannot
+          # be a merchandiser edit, and an exclusion list has to anticipate every
+          # non-theme file that might differ. Keep this list in step with
+          # live-writeback.yml.
+          git fetch -q origin "$BASE_BRANCH" "$LIVE_BRANCH"
+
+          CHANGED=$(git diff --name-only \
+            "origin/$BASE_BRANCH" "origin/$LIVE_BRANCH" -- \
+            assets blocks config layout locales sections snippets templates \
+            | grep -vE '^assets/.*\.(asset|bundle|chunk)\.' \
+            | grep -vE '^assets/(manifest\.json|runtime\.js)$' \
+            | grep -vE '^snippets/(vite-tag|script-tags|style-tags)\.liquid$' \
+            || true)
 
           if [ -n "$CHANGED" ]; then
             {
