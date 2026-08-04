@@ -66,7 +66,7 @@ jobs:
           echo "::notice::Deleted preview theme $THEME_ID ($THEME_NAME)."
 
       - name: Update preview comment
-        uses: marocchino/sticky-pull-request-comment@52423e01640425a022ef5fd42c6fb5f633a02728 # v2.9.1
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
         with:
           header: preview
           message: |
