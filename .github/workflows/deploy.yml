@@ -188,11 +188,6 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config pull.rebase false
 
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
-        with:
-          node-version-file: package.json
-          cache: npm
-
       # Start from the live branch so merchandiser content is the base, then
       # bring in the code. The check-writeback job has already established that
       # there is no unreconciled content, so this merge should be clean.
@@ -228,10 +223,38 @@ jobs:
             exit 1
           fi
 
+      # Whether this theme has a build at all.
+      #
+      # Shopify's integration explicitly supports "a buildless theme, or a theme
+      # that has already gone through any necessary file transformations", so a
+      # theme with no package.json is a legitimate configuration and must deploy
+      # rather than fail. Dawn, used here as the rehearsal subject, is one.
+      #
+      # Detected after the branches are assembled, so it reflects what is
+      # actually being released rather than whatever the initial checkout held.
+      - name: Detect build
+        id: build
+        run: |
+          if [ -f package.json ] && jq -e '.scripts.build' package.json >/dev/null 2>&1; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Build script found. Building before release."
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No build script. Releasing theme files as they are."
+          fi
+
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        if: steps.build.outputs.present == 'true'
+        with:
+          node-version-file: package.json
+          cache: npm
+
       - name: Install dependencies
+        if: steps.build.outputs.present == 'true'
         run: npm ci
 
       - name: Build
+        if: steps.build.outputs.present == 'true'
         run: npm run build
 
       # Assert the build actually produced what the theme needs, rather than
@@ -243,6 +266,7 @@ jobs:
       # fail to load, and Theme Check would not catch it because the file is
       # gitignored and excluded from linting.
       - name: Verify build output
+        if: steps.build.outputs.present == 'true'
         run: |
           set -euo pipefail
           MISSING=0
@@ -273,6 +297,7 @@ jobs:
       # which sweeps in anything else present in the working tree, including files
       # that were gitignored for good reason.
       - name: Commit build output
+        if: steps.build.outputs.present == 'true'
         run: |
           set -euo pipefail
           git add --force \
