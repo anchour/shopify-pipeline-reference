@@ -120,9 +120,14 @@ jobs:
           # design, and .github/, which is CI configuration that Shopify never
           # writes to. A difference under .github/ means the repository is ahead,
           # not that merchandiser work is at risk.
+          # Match Shopify's theme directories positively rather than excluding
+          # everything else. Anything outside them cannot be a merchandiser edit,
+          # and an exclusion list has to anticipate every non-theme file that
+          # might differ, which it will eventually fail to do. This must stay in
+          # step with the directory list in live-writeback.yml.
           CHANGED=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE_BRANCH...$LIVE_BRANCH" \
             --jq '[.files[]?.filename
-                   | select(startswith(".github/") | not)
+                   | select(test("^(assets|blocks|config|layout|locales|sections|snippets|templates)/"))
                    | select(test("^assets/.*\\.(asset|bundle|chunk)\\.") | not)
                    | select(. != "assets/manifest.json" and . != "assets/runtime.js")
                    | select(test("^snippets/(vite-tag|script-tags|style-tags)\\.liquid$") | not)

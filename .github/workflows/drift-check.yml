@@ -81,9 +81,11 @@ jobs:
           # ahead, not merchandiser work at risk. Including it produced comments
           # telling reviewers to merge a write-back pull request for workflow
           # files that no write-back would ever contain.
+          # Positive match on Shopify's theme directories. Must stay in step with
+          # the same filter in deploy.yml and live-writeback.yml.
           CHANGED=$(gh api "repos/$REPO/compare/$BASE_BRANCH...$LIVE_BRANCH" \
             --jq '[.files[]?.filename
-                   | select(startswith(".github/") | not)
+                   | select(test("^(assets|blocks|config|layout|locales|sections|snippets|templates)/"))
                    | select(test("^assets/.*\\.(asset|bundle|chunk)\\.") | not)
                    | select(. != "assets/manifest.json" and . != "assets/runtime.js")
                    | select(test("^snippets/(vite-tag|script-tags|style-tags)\\.liquid$") | not)
