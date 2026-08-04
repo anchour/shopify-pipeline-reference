@@ -155,6 +155,29 @@ Establish how that case is handled before it happens under pressure.
 
 ---
 
+## Things you will see that are not problems
+
+**"`main-live` had recent pushes" with a "Compare & pull request" button.**
+GitHub offers this after any push to a non-default branch. It does not know
+`main-live` is a machine branch, and it will appear after every deploy and every
+merchandiser edit.
+
+**Ignore it. Do not click it.** It would propose merging `main-live` into `main`,
+which is the write-back workflow's job. Doing it by hand drags the compiled build
+output back into source, where it is deliberately gitignored. The banner clears
+itself, or can be dismissed.
+
+**A growing branch count.** Merged pull request branches are not deleted
+automatically. Enable "Automatically delete head branches" in repository settings
+under General, then Pull Requests. Machine branches are unaffected: they are not
+pull request heads.
+
+**"This branch is out-of-date with the base branch."** Deliberate. Required
+status checks are set to strict, so a branch must be current with `main` before
+merging. It prevents checks passing against a stale base. Click **Update branch**.
+
+---
+
 ## What each part demonstrates
 
 | Part | Obligation |
