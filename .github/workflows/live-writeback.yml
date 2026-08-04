@@ -14,6 +14,11 @@ name: Live writeback
 on:
   push:
     branches: [main-live]
+  # Manual retry. Without this, a failed writeback can only be re-attempted by
+  # asking someone to go and edit the theme again, because the push trigger only
+  # fires on Shopify's own commits. A workflow that recovers from its own
+  # failures only by human action in a third-party admin is not operable.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -25,14 +30,23 @@ concurrency:
 env:
   LIVE_BRANCH: main-live
   DATA_BRANCH: main-live-data
-  TARGET_BRANCH: develop
+  # The branch merchandiser content returns to. This is the branch the deploy
+  # builds from, so it must be the one the gate compares against: main here.
+  # Where a develop branch is the integration point, set it to develop and make
+  # sure the deploy gate compares against the same branch, or the gate will
+  # block on content the writeback has already delivered elsewhere.
+  TARGET_BRANCH: main
 
 jobs:
   writeback:
     name: Raise write-back pull request
-    # Only Shopify's own commits. A push from the deploy workflow is our own
-    # release and must not loop back into a pull request.
-    if: github.event.pusher.name == 'shopify[bot]' || github.event.sender.login == 'shopify[bot]'
+    # Only Shopify's own commits, so a release push does not loop back into a
+    # pull request. Manual dispatch bypasses the check: it is a deliberate
+    # retry, and there is no pusher to inspect.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pusher.name == 'shopify[bot]' ||
+      github.event.sender.login == 'shopify[bot]'
     runs-on: ubuntu-latest
 
     steps:
