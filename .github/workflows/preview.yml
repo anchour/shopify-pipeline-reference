@@ -35,7 +35,14 @@ jobs:
       SHOPIFY_FLAG_STORE: ${{ vars.SHOPIFY_STORE }}
       SHOPIFY_CLI_THEME_TOKEN: ${{ secrets.SHOPIFY_CLI_THEME_TOKEN }}
       SHOPIFY_CLI_TTY: 0
-      THEME_NAME: "PR#${{ github.event.pull_request.number }} preview"
+      # Prefix set as a repository variable so the same workflow serves any
+      # store without editing. The prefix groups preview themes together in the
+      # admin theme list, where they sit alongside real themes.
+      #
+      # The number comes second so the name sorts and truncates sensibly:
+      # Shopify shortens long theme names in the admin, and the PR number is the
+      # part someone needs to still be able to read.
+      THEME_NAME: "${{ vars.THEME_PREFIX || '[Preview]' }} PR #${{ github.event.pull_request.number }}"
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

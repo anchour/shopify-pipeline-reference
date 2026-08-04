@@ -108,7 +108,7 @@ jobs:
             exit 0
           fi
 
-          # Any file that differs counts as drift, except build output.
+          # Any file that differs counts as drift, except two categories.
           #
           # Shopify commits whatever changes on a connected theme: settings JSON
           # from the theme editor, Liquid from the code editor, and files written
@@ -116,10 +116,13 @@ jobs:
           # other file through, and this gate exists precisely to stop the deploy
           # overwriting things nobody knew were changed.
           #
-          # The exclusions below are the compiled Vite output, which lives on the
-          # live branch by design and is expected to differ on every release.
+          # Excluded: compiled Vite output, which lives on the live branch by
+          # design, and .github/, which is CI configuration that Shopify never
+          # writes to. A difference under .github/ means the repository is ahead,
+          # not that merchandiser work is at risk.
           CHANGED=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE_BRANCH...$LIVE_BRANCH" \
             --jq '[.files[]?.filename
+                   | select(startswith(".github/") | not)
                    | select(test("^assets/.*\\.(asset|bundle|chunk)\\.") | not)
                    | select(. != "assets/manifest.json" and . != "assets/runtime.js")
                    | select(test("^snippets/(vite-tag|script-tags|style-tags)\\.liquid$") | not)
@@ -271,11 +274,46 @@ jobs:
           echo "released=true" >> "$GITHUB_OUTPUT"
           echo "::notice::Pushed to $LIVE_BRANCH. Shopify will apply it to the live theme."
 
+  # ── Notify ──────────────────────────────────────────────────────────────────
+  #
+  # A separate job so it reports whatever happened, including the case where the
+  # gate blocked and the deploy job never ran.
+  #
+  # The notify step used to live inside the deploy job. When the gate failed,
+  # that job was skipped, so its notify step was skipped too and Slack heard
+  # nothing at all. A deploy that refused to run is exactly the event someone
+  # needs to know about, and it was the one case that stayed silent.
+  notify:
+    name: Notify
+    needs: [check-writeback, deploy]
+    if: always() && (needs.check-writeback.result != 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # Three outcomes worth distinguishing: released, blocked by the gate, or
+      # failed during the build itself.
+      - name: Determine outcome
+        id: outcome
+        run: |
+          set -euo pipefail
+          GATE="${{ needs.check-writeback.result }}"
+          DEPLOY="${{ needs.deploy.result }}"
+
+          if [ "$GATE" = "failure" ]; then
+            echo "status=blocked" >> "$GITHUB_OUTPUT"
+          elif [ "$DEPLOY" = "success" ]; then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          elif [ "$DEPLOY" = "skipped" ]; then
+            echo "status=cancelled" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Notify Slack
-        if: always()
         uses: ./.github/actions/slack-notify
         with:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
-          status: ${{ job.status }}
+          status: ${{ steps.outcome.outputs.status }}
           store-url: ${{ vars.SHOPIFY_STORE && format('https://{0}', vars.SHOPIFY_STORE) || '' }}
           reason: ${{ inputs.reason }}

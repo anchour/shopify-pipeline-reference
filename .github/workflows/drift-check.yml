@@ -71,10 +71,19 @@ jobs:
             exit 0
           fi
 
-          # Everything counts as drift except compiled Vite output, which lives
-          # on the live branch by design. Same exclusions as the deploy gate.
+          # Everything counts as drift except two categories.
+          #
+          # Compiled Vite output lives on the live branch by design and differs
+          # on every release.
+          #
+          # .github/ is CI configuration, never theme content. Shopify does not
+          # write to it, so a difference there is always the repository being
+          # ahead, not merchandiser work at risk. Including it produced comments
+          # telling reviewers to merge a write-back pull request for workflow
+          # files that no write-back would ever contain.
           CHANGED=$(gh api "repos/$REPO/compare/$BASE_BRANCH...$LIVE_BRANCH" \
             --jq '[.files[]?.filename
+                   | select(startswith(".github/") | not)
                    | select(test("^assets/.*\\.(asset|bundle|chunk)\\.") | not)
                    | select(. != "assets/manifest.json" and . != "assets/runtime.js")
                    | select(test("^snippets/(vite-tag|script-tags|style-tags)\\.liquid$") | not)
