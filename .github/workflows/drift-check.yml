@@ -1,0 +1,133 @@
+# Tells reviewers, on the pull request, whether merging would overwrite
+# merchandiser content.
+#
+# WHY THIS EXISTS SEPARATELY FROM THE DEPLOY GATE
+#
+# The deploy workflow also checks for drift, and that check is the one that
+# actually blocks a release. But it runs after the merge, which means the person
+# best placed to act on it, the reviewer, never sees it. They merge, the deploy
+# refuses, and someone has to go and read a failed run to find out why.
+#
+# This puts the same information on the pull request, before the decision.
+#
+# It is deliberately NOT a required check. Drift is a fact about the live store,
+# not a defect in the pull request, and blocking here would let one merchandiser
+# edit freeze every open pull request in the repository. The deploy gate stays
+# authoritative; this is the early warning.
+#
+# RE-EVALUATION
+#
+# Drift is a comparison against a moving target. A pull request opened today can
+# be accurate on open and stale an hour later, because someone changed the theme
+# in the Shopify admin. GitHub only re-runs pull request checks when the pull
+# request branch is pushed to, so a check that ran once would go quietly out of
+# date.
+#
+# The `push` trigger below handles that: when the live branch moves, every open
+# pull request targeting main is re-evaluated and its comment updated.
+name: Drift check
+
+on:
+  pull_request:
+    branches: [main]
+  # The live branch moved. Everything previously reported is now potentially
+  # stale, so refresh all open pull requests.
+  push:
+    branches: [main-live]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  # Per pull request on a pull_request event, and one shared group for the
+  # fan-out, so several rapid Shopify commits collapse into a single refresh.
+  group: drift-check-${{ github.event.pull_request.number || 'refresh-all' }}
+  cancel-in-progress: true
+
+env:
+  BASE_BRANCH: main
+  LIVE_BRANCH: main-live
+
+jobs:
+  drift:
+    name: Live content drift
+    runs-on: ubuntu-latest
+    steps:
+      # One shared script for both triggers. On a pull_request event it reports
+      # on that pull request; on a push to the live branch it reports on every
+      # open pull request targeting main.
+      - name: Evaluate drift and report
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          if ! gh api "repos/$REPO/branches/$LIVE_BRANCH" --silent 2>/dev/null; then
+            echo "::notice::$LIVE_BRANCH does not exist yet. Nothing to compare."
+            exit 0
+          fi
+
+          # Everything counts as drift except compiled Vite output, which lives
+          # on the live branch by design. Same exclusions as the deploy gate.
+          CHANGED=$(gh api "repos/$REPO/compare/$BASE_BRANCH...$LIVE_BRANCH" \
+            --jq '[.files[]?.filename
+                   | select(test("^assets/.*\\.(asset|bundle|chunk)\\.") | not)
+                   | select(. != "assets/manifest.json" and . != "assets/runtime.js")
+                   | select(test("^snippets/(vite-tag|script-tags|style-tags)\\.liquid$") | not)
+                  ] | join("\n")')
+
+          # Which pull requests need a comment.
+          if [ -n "${PR_NUMBER:-}" ]; then
+            TARGETS="$PR_NUMBER"
+          else
+            TARGETS=$(gh pr list --repo "$REPO" --base "$BASE_BRANCH" \
+              --state open --json number --jq '.[].number')
+          fi
+
+          if [ -z "$TARGETS" ]; then
+            echo "::notice::No open pull requests to update."
+            exit 0
+          fi
+
+          if [ -n "$CHANGED" ]; then
+            COUNT=$(echo "$CHANGED" | wc -l | tr -d ' ')
+            BODY="> [!WARNING]"
+            BODY="$BODY"$'\n'"> ### Merging this will not deploy"
+            BODY="$BODY"$'\n\n'"The live theme has $COUNT file(s) not in \`$BASE_BRANCH\`."
+            BODY="$BODY Someone edited the theme in the Shopify admin and those"
+            BODY="$BODY edits exist only on \`$LIVE_BRANCH\`."
+            BODY="$BODY"$'\n\n''```'$'\n'"$CHANGED"$'\n''```'
+            BODY="$BODY"$'\n\n'"**The deploy will refuse to run until this is"
+            BODY="$BODY reconciled.** Merge the write-back pull request first."
+            echo "::warning::Live content drift in $COUNT file(s)."
+          else
+            BODY="Live content is in sync with \`$BASE_BRANCH\`. Merging this will"
+            BODY="$BODY deploy normally."
+            echo "::notice::No live content drift."
+          fi
+
+          # Timestamp so a refreshed comment is visibly current rather than
+          # looking like a stale note from whenever the pull request was opened.
+          BODY="$BODY"$'\n\n'"<sub>Checked against \`$LIVE_BRANCH\` at $(date -u '+%Y-%m-%d %H:%M UTC').</sub>"
+          BODY="$BODY"$'\n'"<!-- drift-check -->"
+
+          # Update the existing comment in place rather than adding another, so a
+          # long-lived pull request does not accumulate a column of them.
+          for PR in $TARGETS; do
+            EXISTING=$(gh api "repos/$REPO/issues/$PR/comments" \
+              --jq '[.[] | select(.body | contains("<!-- drift-check -->")) | .id] | .[0] // ""')
+
+            if [ -n "$EXISTING" ]; then
+              gh api -X PATCH "repos/$REPO/issues/comments/$EXISTING" \
+                -f body="$BODY" --silent
+              echo "Updated drift comment on #$PR"
+            else
+              gh api -X POST "repos/$REPO/issues/$PR/comments" \
+                -f body="$BODY" --silent
+              echo "Posted drift comment on #$PR"
+            fi
+          done
